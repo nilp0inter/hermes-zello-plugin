@@ -41,6 +41,16 @@ logger = logging.getLogger(__name__)
 FlushCallback = Callable[[str, bytes, int], Awaitable[None]]
 
 
+# Bound for ``flush_all`` waiting on in-flight consumer tasks during
+# shutdown.  Each consumer is blocked on ``IncomingAudioStream.decode()``
+# which only exits when ``None`` is pushed into the per-stream queue.
+# When the WS dies mid-PTT (deploy restart, network blip), aiozello never
+# delivers ``on_stream_stop`` so no ``None`` is ever pushed — leaving the
+# decode loop blocked forever.  We push the None sentinels ourselves and
+# bound the wait so a misbehaving stream cannot wedge shutdown.
+_FLUSH_ALL_CONSUMER_TIMEOUT_S = 2.0
+
+
 @dataclass
 class _UserState:
     sender: str
@@ -122,15 +132,56 @@ class UtteranceAggregator:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
-    async def flush_all(self) -> None:
-        """Force-flush every pending user state.  Called on disconnect."""
-        # Wait for in-flight consumer tasks to land their final PCM chunk so
-        # the flush is complete, not partial.  Bounded — consumers either
-        # finish on EOF or hit network close.
+    async def flush_all(self, *, consumer_timeout_s: float = _FLUSH_ALL_CONSUMER_TIMEOUT_S) -> None:
+        """Force-flush every pending user state.  Called on disconnect.
+
+        Robust against mid-PTT WS death: aiozello pushes ``None`` into a
+        stream's queue only when it dispatches ``on_stream_stop``; if the
+        WS closes first, that dispatch never happens and any consumer
+        blocked on ``decode()`` would hang forever.  We push ``None``
+        into every open ``IncomingAudioStream.incoming`` queue ourselves,
+        then bound the gather so a misbehaving consumer cannot wedge
+        shutdown — surviving partial PCM still lands via ``_append`` when
+        the consumer drains; truly-stuck consumers are cancelled.
+        """
+        # 1. Unblock all consumers — push the EOF sentinel into every open
+        #    inbound stream's queue.  Safe to call even if the stream already
+        #    received a real on_stream_stop (the queue just gets two Nones;
+        #    decode() exits on the first).
+        for stream in list(getattr(self._app, "streams", {}).values()):
+            try:
+                await stream.put(None)
+            except Exception:
+                logger.debug("zello: stream.put(None) during flush_all raised", exc_info=True)
+
+        # 2. Wait for consumers to finish so per-user PCM is fully drained
+        #    into the aggregator state, with a hard ceiling.
         pending = list(self._consumer_tasks)
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=consumer_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                stuck = [t for t in pending if not t.done()]
+                logger.warning(
+                    "zello: flush_all consumer timeout after %.1fs — cancelling %d stuck task(s)",
+                    consumer_timeout_s,
+                    len(stuck),
+                )
+                for t in stuck:
+                    t.cancel()
+                # One last gather to absorb the cancellations; bounded too.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*stuck, return_exceptions=True),
+                        timeout=0.5,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("zello: stuck consumers ignored their cancel()")
 
+        # 3. Flush remaining per-user state.
         senders = list(self._states.keys())
         for sender in senders:
             await self._flush_now(sender, reason="shutdown")

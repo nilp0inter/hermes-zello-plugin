@@ -465,17 +465,6 @@ async def _standalone_send(
     if not os.path.exists(cfg.private_key_path):
         return {"error": f"zello standalone send: private key missing at {cfg.private_key_path}"}
 
-    token_manager = LocalTokenManager(cfg.issuer, cfg.private_key_path)
-    app = Application(
-        token=None,
-        token_loader=token_manager.issue,
-        token_refresh_interval_s=0,  # one-shot; no refresh loop
-        username=cfg.username,
-        password=cfg.password,
-        channels=[cfg.channel],
-        callbacks={},
-    )
-
     connected = asyncio.Event()
 
     async def _on_status(event: ChannelStatus) -> None:
@@ -484,7 +473,16 @@ async def _standalone_send(
         if event.status.lower() == "online":
             connected.set()
 
-    app.callbacks["on_channel_status"] = app.callbacks["on_channel_status"].__wrapped__ if hasattr(app.callbacks["on_channel_status"], "__wrapped__") else _on_status  # best-effort; aiozello replaces with print_callback otherwise
+    token_manager = LocalTokenManager(cfg.issuer, cfg.private_key_path)
+    app = Application(
+        token=None,
+        token_loader=token_manager.issue,
+        token_refresh_interval_s=0,  # one-shot; no refresh loop
+        username=cfg.username,
+        password=cfg.password,
+        channels=[cfg.channel],
+        callbacks={"on_channel_status": _on_status},
+    )
 
     run_task = asyncio.create_task(app.run(), name="zello-standalone-run")
     try:

@@ -160,19 +160,31 @@ class DriftForwardPacer:
         sleep_fn=None,
     ):
         self.packet_duration_s = packet_duration_s
-        if time_fn is None or sleep_fn is None:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
-            self._time = time_fn or loop.time
-            self._sleep = sleep_fn or asyncio.sleep
-        else:
-            self._time = time_fn
-            self._sleep = sleep_fn
+        # Don't bind the running loop at __init__ — defer to first reset()/tick()
+        # so the pacer is safe to construct outside a running event loop
+        # (avoids the get_event_loop_policy().get_event_loop() deprecation
+        # warning in Python 3.12+).
+        self._time_fn_override = time_fn
+        self._sleep_fn_override = sleep_fn
+        self._time = None  # resolved lazily
+        self._sleep = None
         self._next_send_at: float = 0.0
 
+    def _resolve(self) -> None:
+        if self._time is not None:
+            return
+        if self._time_fn_override is not None:
+            self._time = self._time_fn_override
+        else:
+            self._time = asyncio.get_running_loop().time
+        self._sleep = self._sleep_fn_override or asyncio.sleep
+
     def reset(self) -> None:
+        self._resolve()
         self._next_send_at = self._time()
 
     async def tick(self) -> None:
+        self._resolve()
         self._next_send_at += self.packet_duration_s
         delta = self._next_send_at - self._time()
         if delta > 0:
@@ -213,11 +225,16 @@ async def stream_audio_to_zello(
 
     async with app.outbound_stream(codec_header, _PACKET_DURATION_MS) as stream:
         pacer.reset()
-        for frame in frames:
+        last = len(frames) - 1
+        for i, frame in enumerate(frames):
             opus_bytes = encoder.encode(frame, _SAMPLES_PER_FRAME)
             await stream.send(opus_bytes)
             packets_sent += 1
-            await pacer.tick()
+            # Skip the sleep after the FINAL packet — nothing follows it, and
+            # waiting another packet_duration_s before sending stop_stream
+            # serves no purpose.
+            if i < last:
+                await pacer.tick()
 
     logger.info("outbound: streamed %d opus packets (%.2fs of audio)",
                 packets_sent, packets_sent * _PACKET_DURATION_S)

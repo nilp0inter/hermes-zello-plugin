@@ -7,9 +7,12 @@ construction (runtime config).
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Defaults matching plan §4.2.
@@ -60,10 +63,22 @@ def _parse_csv(raw: str) -> frozenset[str]:
     return frozenset(s.strip() for s in raw.split(",") if s.strip())
 
 
-def _parse_float(raw: str, default: float) -> float:
+def _parse_float(raw: str, default: float, *, name: str = "") -> float:
+    if raw is None or raw == "":
+        return default
     try:
         return float(raw)
     except (TypeError, ValueError):
+        if name:
+            logger.warning(
+                "zello: %s=%r is not a valid float; falling back to default %r",
+                name, raw, default,
+            )
+        else:
+            logger.warning(
+                "zello: %r is not a valid float; falling back to default %r",
+                raw, default,
+            )
         return default
 
 
@@ -97,9 +112,13 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ZelloConfig:
         allow_all_users=_parse_bool(e.get("ZELLO_ALLOW_ALL_USERS", "")),
         home_channel=(e.get("ZELLO_HOME_CHANNEL") or "").strip() or None,
         aggregator_window_s=_parse_float(
-            e.get("ZELLO_AGGREGATOR_WINDOW_S", ""), _DEFAULT_AGGREGATOR_WINDOW_S
+            e.get("ZELLO_AGGREGATOR_WINDOW_S", ""),
+            _DEFAULT_AGGREGATOR_WINDOW_S,
+            name="ZELLO_AGGREGATOR_WINDOW_S",
         ),
         max_utterance_s=_parse_float(
-            e.get("ZELLO_MAX_UTTERANCE_S", ""), _DEFAULT_MAX_UTTERANCE_S
+            e.get("ZELLO_MAX_UTTERANCE_S", ""),
+            _DEFAULT_MAX_UTTERANCE_S,
+            name="ZELLO_MAX_UTTERANCE_S",
         ),
     )

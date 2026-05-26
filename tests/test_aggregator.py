@@ -263,6 +263,120 @@ async def test_unknown_stream_id_is_no_op():
     assert flush.calls == []
 
 
+class _NeverEndingStream:
+    """Stand-in for ``IncomingAudioStream`` whose ``decode()`` never EOFs.
+
+    Models the failure mode where ``app.disconnect()`` closes the WS mid-PTT
+    before ``on_stream_stop`` fires, so no ``None`` sentinel ever lands in
+    the queue.  Used by the deadlock regression test below.
+
+    Exposes ``incoming`` as a real ``asyncio.Queue`` so the aggregator's
+    sentinel-push (``stream.put(None)``) can terminate the decode loop —
+    mirroring the real ``IncomingAudioStream.put`` contract.
+    """
+
+    def __init__(self):
+        self.incoming: asyncio.Queue = asyncio.Queue()
+        self.drained = False
+
+    async def decode(self):
+        # Never EOFs on its own; only the queue's None sentinel can stop it.
+        while True:
+            item = await self.incoming.get()
+            if item is None:
+                return
+            yield item
+
+    async def put(self, item) -> None:
+        await self.incoming.put(item)
+
+    async def drain(self) -> None:
+        self.drained = True
+
+
+@pytest.mark.asyncio
+async def test_flush_all_unblocks_consumers_when_ws_dies_mid_ptt():
+    """Regression: if the WS dies before on_stream_stop, the consumer task
+    is blocked on decode() waiting for a None that will never arrive.
+    flush_all() must (a) push the sentinel itself and (b) bound the wait
+    so a misbehaving stream cannot wedge shutdown."""
+    app = _FakeApp()
+    never_ending = _NeverEndingStream()
+    app.streams[1] = never_ending
+    flush = _Recorder()
+
+    agg = UtteranceAggregator(
+        app, flush,
+        allowed_users={"nilp0inter_dev"},
+        allow_all=False,
+        window_s=10.0,            # large — would never fire on its own
+        max_utterance_s=300.0,
+    )
+
+    await agg.on_stream_start(_stream_start(1, "nilp0inter_dev"))
+    # Push a chunk so the consumer has buffered PCM to flush.
+    await never_ending.put(_HALF_SEC_PCM)
+    await asyncio.sleep(0.05)  # let the consumer absorb the chunk
+
+    # Now disconnect: flush_all must return in well under the configured
+    # consumer timeout, NOT hang waiting for a None that will never arrive.
+    await asyncio.wait_for(
+        agg.flush_all(consumer_timeout_s=0.3),
+        timeout=1.0,
+    )
+
+    # The half-second of buffered PCM should still have been flushed.
+    assert len(flush.calls) == 1
+    sender, pcm, _ = flush.calls[0]
+    assert sender == "nilp0inter_dev"
+    assert pcm == _HALF_SEC_PCM
+
+
+@pytest.mark.asyncio
+async def test_flush_all_cancels_consumers_that_ignore_eof():
+    """If a consumer ignores the None sentinel (truly stuck), flush_all
+    must cancel and move on — never block indefinitely."""
+
+    class _ZombieStream:
+        def __init__(self):
+            self.incoming: asyncio.Queue = asyncio.Queue()
+
+        async def decode(self):
+            # Ignore the None sentinel and keep looping on an empty queue.
+            # This models a misbehaving stream impl that swallows EOF.
+            await asyncio.Event().wait()  # blocks forever
+            yield b""  # unreachable
+
+        async def put(self, item) -> None:
+            await self.incoming.put(item)
+
+        async def drain(self) -> None:
+            pass
+
+    app = _FakeApp()
+    app.streams[1] = _ZombieStream()
+    flush = _Recorder()
+
+    agg = UtteranceAggregator(
+        app, flush,
+        allowed_users={"nilp0inter_dev"},
+        allow_all=False,
+        window_s=10.0,
+        max_utterance_s=300.0,
+    )
+
+    await agg.on_stream_start(_stream_start(1, "nilp0inter_dev"))
+    await asyncio.sleep(0.05)
+
+    # Bounded — even though the consumer never exits voluntarily.
+    await asyncio.wait_for(
+        agg.flush_all(consumer_timeout_s=0.2),
+        timeout=1.0,
+    )
+    # No buffered PCM was ever produced by the zombie; flush list stays empty.
+    assert flush.calls == []
+
+
 @pytest.mark.asyncio
 async def test_on_stream_stop_is_a_no_op():
     """``on_stream_stop`` should not crash and not produce a flush by itself
