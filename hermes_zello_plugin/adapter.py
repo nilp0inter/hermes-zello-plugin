@@ -122,6 +122,17 @@ class ZelloAdapter(BasePlatformAdapter):
         self._run_task: Optional[asyncio.Task] = None
         self._connected_event: asyncio.Event = asyncio.Event()
 
+        # Force auto-TTS on for this channel.  Zello is voice-only — text
+        # delivery via send() is a no-op.  The base adapter's TTS path
+        # (gateway/platforms/base.py:3607) gates on
+        # _should_auto_tts_for_chat, which consults _auto_tts_enabled_chats
+        # BEFORE the global voice.auto_tts default.  Registering the
+        # channel here makes auto-TTS unconditional and survives any
+        # _sync_voice_mode_state_to_adapter swallowed-exception path.
+        if hasattr(self, "_auto_tts_enabled_chats"):
+            self._auto_tts_enabled_chats.add(self._zello_cfg.channel)
+        self._auto_tts_default = True
+
     @property
     def name(self) -> str:
         return "Zello"
