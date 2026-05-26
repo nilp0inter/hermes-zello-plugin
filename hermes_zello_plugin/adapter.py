@@ -25,6 +25,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     cache_audio_from_bytes,
+    resolve_channel_prompt,
 )
 from gateway.config import Platform, PlatformConfig  # noqa: F401 - PlatformConfig for typing only
 from gateway.session import SessionSource  # noqa: F401 - re-exported for completeness
@@ -303,12 +304,22 @@ class ZelloAdapter(BasePlatformAdapter):
             user_id=sender,
             user_name=sender,
         )
+        # Per-channel ephemeral system prompt: hermes auto-bridges
+        # ``platforms.zello.channel_prompts.<chat_id>`` from config.yaml
+        # into ``config.extra["channel_prompts"]`` (gateway/config.py:865).
+        # resolve_channel_prompt is the shared helper used by Telegram,
+        # Slack et al. — returns None if no prompt is configured for this
+        # channel, in which case only the static PLATFORM_HINT applies.
+        channel_prompt = resolve_channel_prompt(
+            self.config.extra, self._zello_cfg.channel
+        )
         event = MessageEvent(
             text="",  # transcript will be filled in by hermes' STT pipeline
             message_type=MessageType.VOICE,
             source=source,
             media_urls=[path],
             media_types=["audio/ogg"],
+            channel_prompt=channel_prompt,
         )
         logger.info(
             "[%s] dispatching VOICE MessageEvent sender=%s bytes=%d path=%s",

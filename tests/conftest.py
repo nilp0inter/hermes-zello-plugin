@@ -185,11 +185,33 @@ class _BasePlatformAdapter:
         self.handle_message_calls.append(event)
 
 
+def _resolve_channel_prompt(config_extra, channel_id, parent_id=None):
+    """Stub mirroring gateway.platforms.base.resolve_channel_prompt.
+
+    Looks up channel_prompts in config.extra; returns the matching prompt
+    string or None.
+    """
+    prompts = (config_extra or {}).get("channel_prompts") or {}
+    if not isinstance(prompts, dict):
+        return None
+    for key in (channel_id, parent_id):
+        if not key:
+            continue
+        prompt = prompts.get(key)
+        if prompt is None:
+            continue
+        prompt = str(prompt).strip()
+        if prompt:
+            return prompt
+    return None
+
+
 _gw_platforms_base.BasePlatformAdapter = _BasePlatformAdapter
 _gw_platforms_base.MessageEvent = _MessageEvent
 _gw_platforms_base.MessageType = _MessageType
 _gw_platforms_base.SendResult = _SendResult
 _gw_platforms_base.cache_audio_from_bytes = _cache_audio_from_bytes
+_gw_platforms_base.resolve_channel_prompt = _resolve_channel_prompt
 
 
 # ── Install stubs ────────────────────────────────────────────────────────
