@@ -1,0 +1,51 @@
+name: hermes-zello-plugin
+label: Zello
+kind: platform
+version: 0.1.0
+description: >
+  Zello Channel API platform adapter for Hermes Agent.
+  Long-form voice memos in, short clarifying questions / action
+  proposals out. PTT-driven, half-duplex.
+author: nilp0inter
+requires_env:
+  - name: ZELLO_ISSUER
+    description: "Zello developer-console issuer ID (JWT iss claim)"
+    prompt: "Zello issuer"
+    password: false
+  - name: ZELLO_PRIVATE_KEY_PATH
+    description: "Filesystem path to the Zello-issued RSA private key (PEM)"
+    prompt: "Private key path"
+    password: false
+  - name: ZELLO_USERNAME
+    description: "Zello account username this bot connects as"
+    prompt: "Zello username"
+    password: false
+  - name: ZELLO_PASSWORD
+    description: "Zello account password"
+    prompt: "Zello password"
+    password: true
+  - name: ZELLO_CHANNEL
+    description: "Zello channel to join (must be created in the developer console)"
+    prompt: "Channel name"
+    password: false
+optional_env:
+  - name: ZELLO_ALLOWED_USERS
+    description: "Comma-separated Zello usernames allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: ZELLO_ALLOW_ALL_USERS
+    description: "Allow any channel member to talk to the bot (dev only)"
+    prompt: "Allow all? (true/false)"
+    password: false
+  - name: ZELLO_HOME_CHANNEL
+    description: "Channel for cron / notification delivery (defaults to ZELLO_CHANNEL)"
+    prompt: "Home channel (or empty)"
+    password: false
+  - name: ZELLO_AGGREGATOR_WINDOW_S
+    description: "Seconds of idle after a stream_stop before flushing aggregated utterance (default 2)"
+    prompt: "Aggregator window (s)"
+    password: false
+  - name: ZELLO_MAX_UTTERANCE_S
+    description: "Max wall-clock seconds an aggregator will hold before forced flush (default 300)"
+    prompt: "Max utterance (s)"
+    password: false

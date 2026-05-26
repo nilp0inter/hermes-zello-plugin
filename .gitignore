@@ -71,3 +71,6 @@ private.key
 private.pem
 *.key
 *.pem
+
+# VM images (scratch, not part of the plugin)
+*.qcow2
