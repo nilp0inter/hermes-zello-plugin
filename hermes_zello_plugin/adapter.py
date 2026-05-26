@@ -358,7 +358,12 @@ class ZelloAdapter(BasePlatformAdapter):
         voice-mode state, no double-delivery risk (auto-TTS is force-
         disabled by _should_auto_tts_for_chat above).
         """
-        speech_text = self.prepare_tts_text(content or "")
+        # Inline markdown-strip + length-cap.  Mirrors the
+        # base-adapter helper (gateway/platforms/base.py:2264 in
+        # upstream main) but kept local because our pinned hermes
+        # commit predates the helper landing on BasePlatformAdapter.
+        import re as _re
+        speech_text = _re.sub(r'[*_`#\[\]()]', '', content or '')[:4000].strip()
         if not speech_text:
             logger.info(
                 "[%s] send: empty text after markdown cleanup; nothing to speak",
