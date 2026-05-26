@@ -123,17 +123,6 @@ class ZelloAdapter(BasePlatformAdapter):
         self._run_task: Optional[asyncio.Task] = None
         self._connected_event: asyncio.Event = asyncio.Event()
 
-        # Force auto-TTS on for this channel.  Zello is voice-only — text
-        # delivery via send() is a no-op.  The base adapter's TTS path
-        # (gateway/platforms/base.py:3607) gates on
-        # _should_auto_tts_for_chat, which consults _auto_tts_enabled_chats
-        # BEFORE the global voice.auto_tts default.  Registering the
-        # channel here makes auto-TTS unconditional and survives any
-        # _sync_voice_mode_state_to_adapter swallowed-exception path.
-        if hasattr(self, "_auto_tts_enabled_chats"):
-            self._auto_tts_enabled_chats.add(self._zello_cfg.channel)
-        self._auto_tts_default = True
-
     @property
     def name(self) -> str:
         return "Zello"
@@ -332,6 +321,18 @@ class ZelloAdapter(BasePlatformAdapter):
 
     # ── BasePlatformAdapter overrides ─────────────────────────────────────
 
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        """Plugin owns the TTS path via ``send()``; disable base auto-TTS.
+
+        Returning False here prevents the base adapter's auto-TTS block
+        (gateway/platforms/base.py:3607) from firing.  Without this, a
+        future configuration change that successfully enables auto-TTS
+        would deliver the same reply twice — once via play_tts and once
+        via our send() (which now also synthesizes).  Belt-and-braces
+        even though the current deployments don't trigger the base path.
+        """
+        return False
+
     async def send(
         self,
         chat_id: str,
@@ -339,16 +340,72 @@ class ZelloAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        logger.warning(
-            "[%s] send() called on voice-only adapter; ignoring (chat_id=%s len=%d)",
-            self.name,
-            chat_id,
-            len(content or ""),
-        )
-        return SendResult(
-            success=False,
-            error="Zello v1 is voice-only; use send_voice / play_tts",
-        )
+        """Synthesize text via hermes' configured TTS and stream as opus.
+
+        Zello has no native text delivery.  Earlier versions of the plugin
+        no-op'd send() and relied on the base adapter's auto-TTS path to
+        intercept text replies before they reached us — but that path
+        depends on per-chat voice-mode state that turned out fragile to
+        bring up declaratively (the _sync_voice_mode_state_to_adapter
+        runner method clears _auto_tts_enabled_chats every reconnect,
+        and load_config() inside its try-block silently returns False
+        in some environments leaving _auto_tts_default at False too).
+
+        Instead, own the path here: call hermes' text_to_speech_tool
+        directly (honors settings.tts.provider / settings.tts.providers.*
+        from config.yaml — ElevenLabs Flash v2.5 in our deployment),
+        then deliver the produced file via send_voice.  No dependency on
+        voice-mode state, no double-delivery risk (auto-TTS is force-
+        disabled by _should_auto_tts_for_chat above).
+        """
+        speech_text = self.prepare_tts_text(content or "")
+        if not speech_text:
+            logger.info(
+                "[%s] send: empty text after markdown cleanup; nothing to speak",
+                self.name,
+            )
+            return SendResult(success=True, message_id="zello-noop")
+
+        try:
+            from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+        except ImportError as e:
+            logger.error("[%s] send: tts_tool import failed: %s", self.name, e)
+            return SendResult(success=False, error=f"tts_tool unavailable: {e}", retryable=False)
+
+        if not check_tts_requirements():
+            logger.error(
+                "[%s] send: TTS not configured (settings.tts.provider missing or API key absent)",
+                self.name,
+            )
+            return SendResult(
+                success=False,
+                error="TTS not configured; set settings.tts.provider + provider API key",
+                retryable=False,
+            )
+
+        import json as _json
+        try:
+            result_str = await asyncio.to_thread(text_to_speech_tool, text=speech_text)
+            tts_data = _json.loads(result_str)
+        except Exception as e:
+            logger.exception("[%s] send: TTS synthesis failed", self.name)
+            return SendResult(success=False, error=f"TTS error: {e}", retryable=True)
+
+        audio_path = tts_data.get("file_path")
+        if not audio_path or not os.path.exists(audio_path):
+            err = tts_data.get("error") or "TTS produced no file"
+            logger.error("[%s] send: %s (result=%r)", self.name, err, tts_data)
+            return SendResult(success=False, error=str(err), retryable=False)
+
+        try:
+            return await self.send_voice(
+                chat_id=chat_id, audio_path=audio_path, metadata=metadata
+            )
+        finally:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
     async def send_image(
         self,
