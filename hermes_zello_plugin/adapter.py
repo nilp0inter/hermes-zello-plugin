@@ -507,24 +507,37 @@ async def _standalone_send(
 
 
 def register(ctx) -> None:
-    """Plugin entry point — called by the Hermes plugin loader."""
-    ctx.register_platform(
+    """Plugin entry point — called by the Hermes plugin loader.
+
+    Hermes' ``ctx.register_platform(...)`` forwards ``**entry_kwargs`` straight
+    into ``PlatformEntry(...)`` (see ``hermes_cli/plugins.py:736``), so any
+    kwarg not declared on that dataclass raises ``TypeError`` at registration
+    time.  Older hermes-agent pins miss newer fields (e.g.
+    ``standalone_sender_fn`` was added after ``faa13e49``); rather than
+    couple the plugin to a specific hermes commit, we introspect
+    ``PlatformEntry``'s signature and drop kwargs the local install doesn't
+    accept.  The skipped kwarg is logged once for visibility.
+    """
+    import inspect
+
+    kwargs: Dict[str, Any] = dict(
         name="zello",
         label="Zello",
         adapter_factory=lambda cfg: ZelloAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=list(
-            (
-                "ZELLO_ISSUER",
-                "ZELLO_PRIVATE_KEY_PATH",
-                "ZELLO_USERNAME",
-                "ZELLO_PASSWORD",
-                "ZELLO_CHANNEL",
-            )
+        required_env=[
+            "ZELLO_ISSUER",
+            "ZELLO_PRIVATE_KEY_PATH",
+            "ZELLO_USERNAME",
+            "ZELLO_PASSWORD",
+            "ZELLO_CHANNEL",
+        ],
+        install_hint=(
+            "uv sync (provides aiozello, opuslib, pyjwt); "
+            "ensure ffmpeg + libopus are on PATH/LD_LIBRARY_PATH"
         ),
-        install_hint="uv sync (provides aiozello, opuslib, pyjwt); ensure ffmpeg + libopus are on PATH/LD_LIBRARY_PATH",
         setup_fn=None,  # no interactive wizard in v1
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="ZELLO_HOME_CHANNEL",
@@ -537,3 +550,21 @@ def register(ctx) -> None:
         allow_update_command=True,
         platform_hint=PLATFORM_HINT,
     )
+
+    try:
+        from gateway.platform_registry import PlatformEntry
+        accepted = set(inspect.signature(PlatformEntry).parameters)
+    except Exception:  # noqa: BLE001
+        # Couldn't introspect — pass through unchanged and let
+        # register_platform raise if there's a mismatch.
+        accepted = set(kwargs)
+
+    dropped = sorted(k for k in kwargs if k not in accepted)
+    filtered = {k: v for k, v in kwargs.items() if k in accepted}
+    if dropped:
+        logger.info(
+            "zello: skipping unsupported PlatformEntry kwargs on this "
+            "hermes version: %s",
+            dropped,
+        )
+    ctx.register_platform(**filtered)
