@@ -29,9 +29,17 @@
         version = "0.1.0";
         src = ./.;
         dontBuild = true;
+        # Hermes' plugin loader (hermes_cli/plugins.py:1443) hardwires
+        #     init_file = plugin_dir / "__init__.py"
+        # i.e. __init__.py MUST sit at the plugin dir root, next to
+        # plugin.yaml — mirroring the in-tree IRC plugin layout.  We
+        # flatten the hermes_zello_plugin/ subpackage into $out so the
+        # relative imports (from .adapter import register, etc.) stay
+        # valid while __init__.py lands where hermes expects it.
         installPhase = ''
           mkdir -p $out
-          cp -r plugin.yaml hermes_zello_plugin $out/
+          cp plugin.yaml $out/
+          cp -r hermes_zello_plugin/. $out/
         '';
       };
     in {
