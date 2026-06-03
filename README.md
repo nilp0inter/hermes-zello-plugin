@@ -50,6 +50,12 @@ Optional:
 
 Out-of-band setup checklist: `SETUP.md`.
 
+## Tools
+
+- `end_session` (`session-control`): ends the current live Zello voice session
+  with Hermes `/new` parity. Intended as the final tool call after a
+  voice-session close such as `cambio y corto`.
+
 ## Test
 
 ```

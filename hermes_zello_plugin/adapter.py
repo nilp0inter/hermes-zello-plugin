@@ -652,3 +652,20 @@ def register(ctx) -> None:
             dropped,
         )
     ctx.register_platform(**filtered)
+
+    from .end_session_tool import (
+        END_SESSION_NAME,
+        END_SESSION_SCHEMA,
+        END_SESSION_TOOLSET,
+        end_session_handler,
+    )
+
+    ctx.register_tool(
+        name=END_SESSION_NAME,
+        toolset=END_SESSION_TOOLSET,
+        schema=END_SESSION_SCHEMA,
+        handler=end_session_handler,
+        is_async=True,
+        description="End the current Zello voice session (full /new parity).",
+        emoji="🛑",
+    )
