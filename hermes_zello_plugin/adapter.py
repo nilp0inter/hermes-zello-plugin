@@ -30,13 +30,14 @@ from gateway.platforms.base import (
 from gateway.config import Platform, PlatformConfig  # noqa: F401 - PlatformConfig for typing only
 from gateway.session import SessionSource  # noqa: F401 - re-exported for completeness
 
-from aiozello.__main__ import Application
-from aiozello.auth import LocalTokenManager
-from aiozello.protocol import ChannelStatus, StreamStart, StreamStop, TextMessage
-
-from .aggregator import UtteranceAggregator
+# Heavy runtime deps (aiozello, opuslib) and modules that import them
+# (.aggregator, .outbound) are NOT imported at module level so this
+# module loads cleanly in processes that don't have those Python
+# packages on PYTHONPATH — notably the hermes-dashboard service, which
+# enumerates plugins to compute "is this platform connected" but never
+# actually runs the adapter.  Lazy-imported inside the methods that
+# need them.  See HERMES-ZELLO-PLAN.md follow-up audit.
 from .config import load_config, missing_required, ZelloConfig
-from .outbound import stream_audio_to_zello, FfmpegDecodeError
 from .platform_hint import PLATFORM_HINT
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ async def _pcm_to_ogg_opus(
     container Hermes' STT layer can read.  Subprocess in / out via pipes;
     no temp files.
     """
+    from .outbound import FfmpegDecodeError  # lazy: outbound pulls opuslib
+
     ffmpeg = ffmpeg_bin or shutil.which("ffmpeg")
     if not ffmpeg:
         raise FfmpegDecodeError("ffmpeg binary not found on PATH")
@@ -130,6 +133,12 @@ class ZelloAdapter(BasePlatformAdapter):
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self) -> bool:
+        # Lazy imports so adapter.py loads in processes that don't have
+        # aiozello / opuslib on PYTHONPATH (e.g. hermes-dashboard).
+        from aiozello.__main__ import Application
+        from aiozello.auth import LocalTokenManager
+        from .aggregator import UtteranceAggregator
+
         cfg = self._zello_cfg
 
         if not os.path.exists(cfg.private_key_path):
@@ -279,6 +288,8 @@ class ZelloAdapter(BasePlatformAdapter):
     async def _handle_utterance(
         self, sender: str, pcm: bytes, sample_rate_hz: int
     ) -> None:
+        from .outbound import FfmpegDecodeError  # lazy: outbound pulls opuslib
+
         try:
             ogg_bytes = await _pcm_to_ogg_opus(pcm, sample_rate_hz)
         except FfmpegDecodeError as e:
@@ -293,12 +304,15 @@ class ZelloAdapter(BasePlatformAdapter):
             user_id=sender,
             user_name=sender,
         )
-        # Per-channel ephemeral system prompt: hermes auto-bridges
-        # ``platforms.zello.channel_prompts.<chat_id>`` from config.yaml
-        # into ``config.extra["channel_prompts"]`` (gateway/config.py:865).
-        # resolve_channel_prompt is the shared helper used by Telegram,
-        # Slack et al. — returns None if no prompt is configured for this
-        # channel, in which case only the static PLATFORM_HINT applies.
+        # Per-channel ephemeral system prompt.  ``config.extra["channel_prompts"]``
+        # is seeded from top-level ``zello.channel_prompts.<chat_id>:`` in
+        # ``~/.hermes/config.yaml`` by :func:`_env_enablement` — required
+        # on hermes ≤ ``faa13e49`` whose ``gateway/config.py`` bridging
+        # loop iterates ``list(Platform)`` only (built-ins).  On newer
+        # hermes versions the generic loop covers plugin platforms too;
+        # the env-enablement seed is harmless there (same key/value).
+        # resolve_channel_prompt returns None if nothing is configured,
+        # leaving only the static PLATFORM_HINT in effect.
         channel_prompt = resolve_channel_prompt(
             self.config.extra, self._zello_cfg.channel
         )
@@ -445,6 +459,8 @@ class ZelloAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **_kwargs,
     ) -> SendResult:
+        from .outbound import stream_audio_to_zello, FfmpegDecodeError  # lazy: opuslib
+
         if self._app is None:
             return SendResult(success=False, error="Zello adapter not connected")
         try:
@@ -470,16 +486,25 @@ class ZelloAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    """Verify imports + required env vars are present."""
+    """Verify lightweight deps + required env vars are present.
+
+    ``check_fn`` is the dashboard's "is this platform configurable on this
+    host?" gate (see ``hermes_cli/web_server.py::status_payload`` →
+    ``GatewayConfig.get_connected_platforms``).  Heavy runtime deps
+    (``aiozello``, ``opuslib``, ``ffmpeg``) are NOT checked here —
+    they're required only when the adapter actually runs, which happens
+    in the gateway process where they're available; gating dashboard
+    visibility on those would silently hide a correctly-configured
+    plugin in deployments where the dashboard service has a slimmer
+    PYTHONPATH than the gateway service.  Mirrors the Mattermost
+    plugin's lightweight ``check_mattermost_requirements`` (just
+    ``import aiohttp``).  Adapter ``connect()`` surfaces missing heavy
+    deps via ``_set_fatal_error``.
+    """
     try:
-        import aiozello  # noqa: F401
-        import opuslib  # noqa: F401
         import jwt  # noqa: F401
     except ImportError as e:
-        logger.warning("zello: dependency import failed: %s", e)
-        return False
-    if shutil.which("ffmpeg") is None:
-        logger.warning("zello: ffmpeg not found on PATH")
+        logger.warning("zello: pyjwt import failed: %s", e)
         return False
     return not missing_required()
 
@@ -495,24 +520,102 @@ def is_connected(_config) -> bool:
 
 
 def _env_enablement() -> Optional[dict]:
-    """Seed PlatformConfig.extra from env vars during gateway config load.
+    """Seed PlatformConfig.extra from env vars + config.yaml.
 
-    Mirrors IRC's hook (``plugins/platforms/irc/adapter.py:651``) so the
-    plugin shows up in ``hermes gateway status`` without adapter
-    instantiation.  All Zello config lives in env vars; the returned dict
-    seeds ``home_channel`` only.
+    Mirrors IRC's hook (``plugins/platforms/irc/adapter.py:651``).  Two
+    responsibilities:
+
+    1. Seed ``channel`` and ``home_channel`` from env vars so the
+       plugin shows up in ``hermes gateway status`` without instantiating
+       the adapter.
+    2. **Seed ``channel_prompts`` from ``~/.hermes/config.yaml``.**
+       On hermes-agent ≤ ``faa13e49`` the shared YAML→extra bridging
+       loop in ``gateway/config.py`` iterates ``list(Platform)`` only
+       (built-ins), so plugin platforms never get their
+       ``channel_prompts`` key bridged into ``PlatformConfig.extra``.
+       Without this seed, ``resolve_channel_prompt(self.config.extra,
+       chat_id)`` in the adapter returns ``None`` and per-channel
+       ephemeral prompts silently never reach the agent.  On newer
+       hermes versions (after the shared loop learned to enumerate
+       plugin entries) the same key is populated by the generic loop
+       too; ``extra.update(seed)`` preserves it either way.
     """
     channel = os.getenv("ZELLO_CHANNEL", "").strip()
     if not channel:
         return None
     seed: dict[str, Any] = {"channel": channel}
-    home = os.getenv("ZELLO_HOME_CHANNEL", "").strip() or channel
+
+    # Read channel_prompts from config.yaml (production hermes
+    # workaround — see docstring).
+    try:
+        import yaml  # transitive hermes dep
+        from pathlib import Path
+
+        home_str = os.getenv("HERMES_HOME", "").strip()
+        hermes_home = Path(home_str) if home_str else (Path.home() / ".hermes")
+        cfg_path = hermes_home / "config.yaml"
+        if cfg_path.exists():
+            with cfg_path.open(encoding="utf-8") as f:
+                ycfg = yaml.safe_load(f) or {}
+            zello_block = ycfg.get("zello") or {}
+            cp = zello_block.get("channel_prompts")
+            if isinstance(cp, dict):
+                seed["channel_prompts"] = {str(k): v for k, v in cp.items()}
+    except Exception as e:  # noqa: BLE001
+        logger.debug("zello: channel_prompts seed from config.yaml skipped: %s", e)
+
+    home_channel = os.getenv("ZELLO_HOME_CHANNEL", "").strip() or channel
     seed["home_channel"] = {
         "platform": "zello",
-        "chat_id": home,
-        "name": home,
+        "chat_id": home_channel,
+        "name": home_channel,
     }
     return seed
+
+
+def _apply_yaml_config(
+    yaml_cfg: dict, zello_cfg: dict
+) -> Optional[dict]:
+    """Translate ``config.yaml`` ``zello:`` keys into ``ZELLO_*`` env vars.
+
+    Mirrors ``plugins/platforms/mattermost/adapter.py::_apply_yaml_config``
+    (PlatformEntry hook landed in hermes #24836 / #25443).  Older hermes
+    versions (e.g. the user's deployed ``faa13e49``) don't have
+    ``apply_yaml_config_fn`` on ``PlatformEntry``; the compat shim in
+    :func:`register` drops the kwarg silently in that case — this hook
+    activates automatically once hermes-agent is upgraded.
+
+    Env vars take precedence over YAML — every assignment is guarded by
+    ``not os.getenv(...)``.  Returns ``None`` because everything flows
+    through env vars; nothing extra is seeded into ``PlatformConfig.extra``
+    directly (``channel_prompts`` continues to flow via
+    :func:`_env_enablement` so the production fallback path stays
+    intact).
+    """
+    # allowed_users: comma-separated string or list of strings
+    au = zello_cfg.get("allowed_users")
+    if au is not None and not os.getenv("ZELLO_ALLOWED_USERS"):
+        if isinstance(au, list):
+            au = ",".join(str(v) for v in au)
+        os.environ["ZELLO_ALLOWED_USERS"] = str(au)
+
+    if "allow_all_users" in zello_cfg and not os.getenv("ZELLO_ALLOW_ALL_USERS"):
+        os.environ["ZELLO_ALLOW_ALL_USERS"] = str(
+            zello_cfg["allow_all_users"]
+        ).lower()
+
+    if "aggregator_window_s" in zello_cfg and not os.getenv("ZELLO_AGGREGATOR_WINDOW_S"):
+        os.environ["ZELLO_AGGREGATOR_WINDOW_S"] = str(
+            zello_cfg["aggregator_window_s"]
+        )
+
+    if "max_utterance_s" in zello_cfg and not os.getenv("ZELLO_MAX_UTTERANCE_S"):
+        os.environ["ZELLO_MAX_UTTERANCE_S"] = str(zello_cfg["max_utterance_s"])
+
+    if "home_channel" in zello_cfg and not os.getenv("ZELLO_HOME_CHANNEL"):
+        os.environ["ZELLO_HOME_CHANNEL"] = str(zello_cfg["home_channel"])
+
+    return None  # all settings flow through env; channel_prompts flows via env_enablement
 
 
 async def _standalone_send(
@@ -534,6 +637,11 @@ async def _standalone_send(
     the live adapter — but the hook must exist for
     ``deliver=zello`` to be a valid cronjob target.
     """
+    from aiozello.__main__ import Application  # lazy: aiozello
+    from aiozello.auth import LocalTokenManager
+    from aiozello.protocol import ChannelStatus
+    from .outbound import stream_audio_to_zello  # lazy: opuslib
+
     if not media_files:
         return {"error": "zello standalone send: v1 is voice-only; no media_files"}
 
@@ -551,7 +659,7 @@ async def _standalone_send(
 
     connected = asyncio.Event()
 
-    async def _on_status(event: ChannelStatus) -> None:
+    async def _on_status(event) -> None:
         if event.error:
             return
         if event.status.lower() == "online":
@@ -624,6 +732,10 @@ def register(ctx) -> None:
         ),
         setup_fn=None,  # no interactive wizard in v1
         env_enablement_fn=_env_enablement,
+        # YAML→env bridge.  Newer hermes (#24836) consumes this hook
+        # automatically; older hermes lacks the field and the compat
+        # filter below drops it silently.
+        apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="ZELLO_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
         allowed_users_env="ZELLO_ALLOWED_USERS",

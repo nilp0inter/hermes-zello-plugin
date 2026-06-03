@@ -13,6 +13,12 @@ dependencies = [
     "opuslib>=3.0.1",
     "aiohttp>=3.9",
     "pyjwt[crypto]>=2.8",
+    # PyYAML is read by _env_enablement to seed channel_prompts from
+    # ~/.hermes/config.yaml on hermes versions whose bridging loop
+    # doesn't iterate plugin platforms.  Stable hermes-agent transitive
+    # dep, but declared here too so test environments and the plugin
+    # tree's standalone uv-resolved venv have it.
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
